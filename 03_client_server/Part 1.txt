@@ -1,0 +1,172 @@
+ Another early name for the OS was the supervisor or even the master control program.
+
+-- 
+./program hello 42
+int main(int argc, char *argv[]) {
+    // argc == 3
+    // argv[0] == "./program"
+    // argv[1] == "hello"
+    // argv[2] == "42"
+}
+argc = how many arguments
+argv = the arguments themselves
+
+---- 
+Important point : Socket is the doorway between layer 7 and layer 4 (application layer and network layer)
+
+
+How TCP Connection is created 
+Client → SYN
+Server → SYN + ACK
+Client → ACK
+
+How a TCP connection is closed (4-way handshake)
+Side A -> FIN (I'm done sending)
+SIDE B -> ACK (got it, but I may still send)
+SIDE B -> FIN (now I'm done)
+SIDE A -> ACK (final ack)
+
+After final ACK side A enters TIME_WAIT
+
+int val = 1;
+setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+
+setsockopt --> configure a socket
+fd --> file descriptor (The OS keeps a file descriptor, it prevents other resources from accessing the OS's memory)
+SOL_SOCKET --> This tells the system that you are setting the option at the Socket level rather than protocol level (like TCP/IP)
+SO_REUSEADDR --> This allows other connections to form after server and client communication finishes. (usually the server tends to wait for any lost packet in the internet to arrive, which blocks access to server for couple of min when teh server isn't perfoming computation)
+
+
+----
+03_client_server - Building a TCP Client & Server
+----
+
+Common Headers used:
+#include <stdint.h>     // Fixed-width integer types (uint8_t, uint16_t, etc.)
+#include <stdlib.h>     // General utilities: malloc/free, exit, abort
+#include <string.h>     // String/memory ops: memset, memcpy, strcmp
+#include <stdio.h>      // Standard I/O: printf, perror, fprintf
+#include <errno.h>      // Error reporting via errno after system call failures
+#include <unistd.h>     // POSIX API: close, read, write, fork
+#include <arpa/inet.h>  // IP address conversion & byte order (inet_pton, htons, ntohs)
+#include <sys/socket.h> // Core socket API: socket, bind, listen, accept, connect
+#include <netinet/ip.h> // IP protocol definitions (used by client)
+
+----
+Helper functions:
+
+die() --> prints error with errno and aborts the program
+static void die(const char *msg) {
+    int err = errno;
+    fprintf(stderr, "[%d] %s\n", err, msg);
+    abort();
+}
+errno --> a global variable set by system calls when they fail, holds the error code
+
+msg() --> simple message printer to stderr
+static void msg(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+}
+
+----
+SERVER FLOW (5 steps):
+----
+
+1. OBTAIN A FILE DESCRIPTOR (Buy the phone)
+int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+socket() takes 3 args:
+  - domain: AF_INET = IPv4 (address family, how we address machines)
+  - type: SOCK_STREAM = TCP (communication style, how data is delivered)
+  - protocol: 0 = "pick the default protocol for this domain + type"
+Returns a file descriptor (fd), basically an integer the OS uses to track the socket
+
+2. CONFIGURE THE SOCKET (The "Reuse" Hack)
+int val = 1;
+setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+--> Allows you to restart the server immediately without waiting for OS to release the port
+
+3. BIND (Assign the phone number)
+struct sockaddr_in addr = {};
+addr.sin_family = AF_INET;
+addr.sin_port = htons(1234);     // Port 1234 in network byte order
+addr.sin_addr.s_addr = htonl(0); // 0.0.0.0 = listen on ALL interfaces (wildcard)
+
+bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
+
+sockaddr_in --> a struct that holds the address info (family, port, IP)
+htons() --> host to network short (converts port to big-endian / network byte order)
+htonl() --> host to network long (converts IP address to big-endian)
+Why byte order matters: different CPUs store bytes differently (little-endian vs big-endian), network always uses big-endian
+
+4. LISTEN (Turn the ringer on)
+listen(fd, SOMAXCONN);
+SOMAXCONN --> max size of the queue for pending connections (OS-defined constant)
+This tells the OS: "I'm ready to receive connections on this socket"
+
+5. ACCEPT LOOP (The Receptionist)
+while (true) {
+    struct sockaddr_in client_addr = {};
+    socklen_t socklen = sizeof(client_addr);
+    int connfd = accept(fd, (struct sockaddr *)&client_addr, &socklen);
+    if (connfd < 0) { continue; }
+    do_something(connfd);
+    close(connfd);
+}
+
+accept() --> BLOCKS until a client connects, then returns a NEW file descriptor (connfd) just for that client
+- The original fd keeps listening for more connections
+- connfd is used to read/write with the connected client
+- close(connfd) hangs up on that specific client
+
+do_something() --> reads from client, writes back
+  char rbuf[64] = {};
+  ssize_t n = read(connfd, rbuf, 6);   // read up to 6 bytes from client
+  printf("client says: %s\n", rbuf);
+  char wbuf[] = "world";
+  write(connfd, wbuf, sizeof(wbuf));    // send "world" back
+
+----
+CLIENT FLOW (5 steps):
+----
+
+1. Create a socket (same as server)
+int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+2. Connect to the server (The Dialing)
+struct sockaddr_in addr = {};
+addr.sin_family = AF_INET;
+addr.sin_port = htons(1234);
+addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1 (localhost)
+
+connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
+
+INADDR_LOOPBACK --> 127.0.0.1, the loopback address (talks to your own machine)
+connect() --> initiates the TCP 3-way handshake (SYN, SYN+ACK, ACK) with the server
+
+3. Send a message
+char msg[] = "hello";
+write(fd, msg, strlen(msg));
+
+4. Read the response
+char rbuf[100] = {};
+ssize_t n = read(fd, rbuf, sizeof(rbuf));
+
+5. Print and hang up
+printf("server says: %s\n", rbuf);
+close(fd);
+
+----
+Key differences between Server and Client:
+- Server: socket → setsockopt → bind → listen → accept → read/write → close
+- Client: socket → connect → write → read → close
+- Server binds to 0.0.0.0 (all interfaces), Client connects to 127.0.0.1 (localhost)
+- Server gets TWO file descriptors: fd (listening) + connfd (per-client connection)
+- Client only has ONE file descriptor: fd (the connection)
+
+----
+Important caveat with this code:
+TCP is a STREAM protocol, not a message protocol. read() might not get the entire message at once.
+This code assumes read() returns the full message in one call — this is technically "broken".
+Fix: introduce a Protocol that defines where a message starts and ends (covered later).
+
