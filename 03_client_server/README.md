@@ -53,7 +53,7 @@ After the final ACK, Side A enters **TIME_WAIT**.
 | `<unistd.h>` | POSIX API: `close`, `read`, `write`, `fork` |
 | `<arpa/inet.h>` | IP address conversion & byte order (`inet_pton`, `htons`, `ntohs`) |
 | `<sys/socket.h>` | Core socket API: `socket`, `bind`, `listen`, `accept`, `connect` |
-| `<netinet/ip.h>` | IP protocol definitions |
+
 
 ## Helper Functions
 
