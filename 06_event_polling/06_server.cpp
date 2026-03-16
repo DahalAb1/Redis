@@ -56,12 +56,12 @@ struct Conn {
     
     // Read buffer
     size_t rbuf_size = 0;
-    uint8_t rbuf[4 + k_max_msg];
-    
+    uint8_t rbuf[4 + k_max_msg] = {};
+
     // Write buffer
     size_t wbuf_size = 0;
     size_t wbuf_sent = 0;
-    uint8_t wbuf[4 + k_max_msg];
+    uint8_t wbuf[4 + k_max_msg] = {};
 };
 
 // --- State Machine Prototypes ---
@@ -222,16 +222,12 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
     fd_set_nb(connfd);
     
     // 3. Create Conn struct
-    struct Conn *conn = (struct Conn *)malloc(sizeof(struct Conn));
+    struct Conn *conn = new (std::nothrow) Conn();
     if (!conn) {
         close(connfd);
         return -1;
     }
     conn->fd = connfd;
-    conn->state = STATE_REQ;
-    conn->rbuf_size = 0;
-    conn->wbuf_size = 0;
-    conn->wbuf_sent = 0;
     conn_put(fd2conn, conn);
     return 0;
 }
@@ -297,7 +293,7 @@ int main() {
                     // Destroy connection
                     fd2conn[conn->fd] = NULL;
                     (void)close(conn->fd);
-                    free(conn);
+                    delete conn;
                 }
             }
         }
