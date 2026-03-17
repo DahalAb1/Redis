@@ -1,0 +1,101 @@
+Interesting Finds & Learnings
+=============================
+
+## Naming Conventions
+- `k_` prefix = konstant (German "Konstante") — signals a compile-time constant (e.g. `k_max_msg`)
+- `g_` prefix = global variable (e.g. `g_map`)
+- `sin_` in `sin_family`, `sin_port` = sockaddr internet — C has no namespaces, so struct fields use prefixes to avoid collisions
+- `SOL_SOCKET` = Socket Option Level: SOCKET
+
+## Subtle Bugs to Watch For
+- `malloc()` doesn't call C++ constructors — default member initializers like `int fd = -1` silently won't run. Use `new`.
+- `&data` vs `data` — if `data` is a pointer, `&data` gives you the address of the pointer on the stack, not the data. Compiles fine, crashes at runtime.
+- `errno` gets overwritten by the next syscall — snapshot it immediately: `int err = errno;`
+
+## Header Paths Have Meaning
+- `sys/` = kernel-facing interfaces (syscalls like `socket()`, `bind()`)
+- Headers outside `sys/` (like `arpa/inet.h`) = userspace utilities (no syscalls)
+- `struct sockaddr_in` actually lives in `<netinet/in.h>`, not `<arpa/inet.h>` — it only works because `arpa/inet.h` includes it transitively
+
+## C++ File Lifecycle
+- Source (.cpp) → Preprocessor (#include expanded) → Compiler (.o object file) → Linker (executable) → Loader (OS loads into memory) → Runtime
+- Compile time = decided before program runs, baked into binary
+- Link time = symbols resolved across object files ("undefined reference" errors happen here)
+- Runtime = decided while running (user input, network, syscalls)
+
+## Preprocessor is a Mini-Language
+- `#` lines are commands to a separate phase that runs before C++ compilation
+- `#include` literally copy-pastes the entire file — `g++ -E file.cpp` shows the result (thousands of lines from a tiny file)
+
+## Blocking vs Non-Blocking I/O
+
+Every file descriptor starts in **blocking mode** (the default).
+
+### Blocking mode
+When your thread calls `read(fd, buf, 4096)` on a blocking fd:
+- If the client has sent data → returns the data (works normally)
+- If the client has sent nothing → the kernel **puts your thread to sleep**. The thread is removed from the CPU's run queue. It sits there doing nothing until bytes arrive on that socket, then the kernel wakes it up.
+- If the connection is closed → returns 0
+
+Same for `write()`: if the socket's send buffer is full, the thread sleeps until there's space.
+
+With a single-threaded server, a blocking `read()` on one client **freezes the entire server** — every other client waits until that one client sends something.
+
+### Non-blocking mode
+Set with `fcntl(fd, F_SETFL, flags | O_NONBLOCK)`.
+
+After this, the same calls behave differently:
+- If the client has sent data → returns the data (same as blocking)
+- If the client has sent nothing → returns -1 immediately, sets `errno = EAGAIN` ("no data right now, try again later")
+- If the connection is closed → returns 0 (same as blocking)
+
+For `write()`: if the socket buffer is full, returns -1 with `errno = EAGAIN` instead of sleeping.
+
+**Non-blocking calls never sleep.** They either succeed immediately or fail immediately with EAGAIN.
+
+### Why event polling needs non-blocking mode
+`poll()` tells you "fd 7 is readable" — but that might mean only 12 bytes arrived when you want 4096. In blocking mode, `read(fd, buf, 4096)` would sleep waiting for the rest. In non-blocking mode, it returns the 12 bytes and you handle the partial read (accumulating into a buffer across multiple calls, like `try_fill_buffer()` does with `rbuf`).
+
+Also, `poll()` can occasionally report an fd as ready when it isn't (edge cases). Non-blocking mode guarantees you get EAGAIN instead of a deadlock.
+
+### The pattern
+Event loop = `poll()` (tells you WHICH fds are ready) + non-blocking I/O (guarantees your thread NEVER sleeps on a read/write). The two mechanisms are complementary — you need both.
+
+## Event Polling — Why Not Threads or Processes?
+
+### The problem
+Redis uses a single thread. With 10,000 connected clients, how does that one thread know which client has data ready?
+
+### Approach 1: fork() per connection
+Each client gets its own process. At 10,000 connections = 10,000 processes. Each process has its own memory space, its own stack, its own kernel metadata. The CPU can only run N processes at a time (N = number of cores, usually 4-16). So the OS time-slices: runs process A briefly, pauses it (context switch), runs process B, pauses, etc. Context switches between processes are expensive (~5μs) because the CPU's address translation cache (TLB) must be flushed — each process has different memory mappings. A Redis GET takes ~1μs of actual work, so the switching overhead dwarfs the useful work.
+
+### Approach 2: thread per connection
+Lighter than processes (threads share memory, no TLB flush), but each thread still needs its own stack (8MB default on Linux). 10,000 threads = 80GB of stack space reserved. Context switches still cost ~1-5μs. And since all threads share Redis's data (one big hash table), you need mutexes to prevent corruption — mutex contention becomes the bottleneck.
+
+### Approach 3: event loop (what Redis uses)
+One thread. One stack. Zero context switches between connections. The thread calls `poll()` which says "fds 5, 9, 23 have data." The thread serves those 3 clients (~3μs total), then goes back to sleep in `poll()`.
+
+The key insight: at any instant, out of 10,000 clients, maybe 50 have data ready. The other 9,950 are idle. The event loop skips them entirely. Thread-per-connection would waste time context-switching to 9,950 threads that have nothing to do.
+
+### pollfd struct
+`poll()` uses an array of `pollfd` structs:
+```
+struct pollfd {
+    int   fd;       // the file descriptor to monitor
+    short events;   // what YOU want to watch for (POLLIN = readable, POLLOUT = writable)
+    short revents;  // what ACTUALLY happened (kernel fills this in after poll() returns)
+};
+```
+You fill in `fd` and `events`. The kernel fills in `revents`. After `poll()` returns, you loop through the array and only handle entries where `revents` is non-zero — those are the active fds.
+
+## EINTR — Retrying Interrupted Syscalls
+```
+do {
+    rv = read(conn->fd, &conn->rbuf[conn->rbuf_size], cap);
+} while (rv < 0 && errno == EINTR);
+```
+Signals are asynchronous notifications the kernel sends to your process (e.g. `SIGCHLD` when a child exits, `SIGALRM` from a timer, `SIGINT` from Ctrl+C). If a signal arrives while your thread is inside a blocking syscall like `read()`, the kernel pauses `read()` to run the signal handler. After the handler finishes, rather than resuming `read()`, the kernel returns -1 with `errno = EINTR` — "you got interrupted, nothing was read."
+
+Nothing broke. No data was lost. The socket is fine. The `read()` just didn't get a chance to execute. So you retry immediately.
+
+This is a standard Unix pattern: every syscall that can block can return EINTR, and you always retry on EINTR. It costs one comparison per call. Not retrying means a random signal at the wrong moment silently drops a perfectly healthy connection — a bug that's nearly impossible to reproduce and debug.
