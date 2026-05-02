@@ -6,17 +6,76 @@ Each chapter introduces *one* problem and the smallest correct fix for it. Read 
 
 ---
 
-## The journey at a glance
+## The journey
 
-| Chapter | What it adds | What it fixes |
-|---------|--------------|---------------|
-| [03_client_server](./03_client_server/) | TCP client + server using raw BSD sockets | Nothing — establishes the baseline. Quietly broken. |
-| [04_protocol_client_server](./04_protocol_client_server/) | Length-prefix message protocol | TCP is a byte stream — `read()` may return partial messages |
-| [06_event_polling](./06_event_polling/) | Single-threaded event loop with `poll()` + non-blocking I/O | Blocking I/O froze every other client during one slow `read()` |
-| [07_get_sel_del](./07_get_sel_del/) | `GET` / `SET` / `DEL` over a structured request format | The server only echoed bytes — no concept of commands or keys |
-| [08_hashtables](./08_hashtables/) | Intrusive hashtable with progressive resizing | `std::map` is a tree (O(log n)) and a one-shot rehash would stall the loop |
+### [03_client_server](./03_client_server/) — the call that lied
 
-(Numbering skips 05 because that chapter — non-blocking mode — was folded directly into 06.)
+I wanted to send a string from one program to another, so I learned the five-call ceremony — `socket`, `setsockopt`, `bind`, `listen`, `accept` — and wrote a server that did one thing: `read(connfd, rbuf, 6)`. The client wrote `"hello"`. The server printed `"hello"`. It looked finished.
+
+What I didn't see was that I'd asked for 6 bytes and happened to get them, and that this was luck. If the message had been longer, or the client farther away than localhost, the same `read()` would have returned partway through — `"he"`, maybe, or `"hell"` — and the rest would have shown up on the next call. My code had no idea that was even a possibility, because in my head a `read()` corresponded to a `write()`. One message in, one message out.
+
+The model that breaks it: TCP doesn't carry messages at all. It carries a stream of bytes. The sending kernel might split your `write("hello")` across packets, or batch it with the next one. The receiving kernel just dumps whatever arrives into a flat buffer, and `read()` scoops out whatever's there. If the sender wrote `"hello"` then `"world"`, the receiver's first `read()` might return `"hellow"`. There's no syscall anywhere that hands you exactly one message back — at this layer there is no such thing as a message.
+
+So my "working" code was a bug waiting to be tested by a longer string or a slower link. The fix couldn't come from a smarter `read()`; it had to come from a layer above the kernel. I had to invent the concept of a message myself.
+
+### [04_protocol_client_server](./04_protocol_client_server/) — inventing messages
+
+If the kernel won't tell you where a message ends, the message has to tell you itself. The simplest thing that works: prefix every message with its length. Four bytes of `uint32_t`, then that many bytes of payload. The receiver reads exactly 4 bytes, decodes a number, then reads exactly that many more.
+
+That word *exactly* is doing a lot of work. A single `read()` might return fewer bytes than I asked for, for the same reason as in chapter 03. So I wrapped it in a loop:
+
+```cpp
+read_full(fd, buf, n);   // keep calling read() until n bytes have arrived
+write_all(fd, buf, n);   // same idea for write()
+```
+
+This is the moment the mental model from chapter 03 actually finishes inverting. A "message" is not a thing TCP gives you. It's a contract you and the other side agree to honour, sitting one layer above the byte hose. You define the framing, you parse the framing, you enforce the framing. The transport doesn't care.
+
+With framing in place, the server could finally handle more than one request on a connection — `one_request()` in a loop until the client disconnected. But it still served one *client* at a time. As soon as the server entered `read_full()` waiting on client A, the kernel parked the entire thread on a wait queue. Client B could connect and sit there for hours; the server wouldn't even know it existed until A spoke. That isn't a bug in `read_full` — it's a property of the only tool I had. To serve many clients on one thread I'd need a fundamentally different way of asking the kernel "is anybody ready yet?"
+
+### [06_event_polling](./06_event_polling/) — many clients, one thread
+
+The obvious fix to "one client at a time" is a thread per client. It also doesn't work, and the reasons it doesn't work are worth understanding because they're the reason Redis is single-threaded in the first place.
+
+Each thread reserves a stack — 8 MB by default on Linux. Ten thousand connected clients means 80 GB of address space gone, just for stacks. Worse, every time the OS switches the CPU from one thread to another it costs roughly 1-5 microseconds. A Redis `GET` is about 1 microsecond of real work. So most of the CPU's time would be spent shuffling threads in and out, not answering queries. And since all those threads share one hashtable, you'd need mutexes around every operation, and the contention on those mutexes would become its own bottleneck.
+
+Then I noticed the thing that makes this whole approach unnecessary: of those ten thousand connected clients, at any given instant maybe fifty actually have data ready to be read. The other 9,950 are idle, waiting on the user, the network, whatever. Dedicating a thread to each of them is paying the cost of switching between 10,000 things to do work for only 50.
+
+The alternative: ask the kernel directly. `poll()` takes an array of file descriptors and returns the ones that are actually ready. Hand it the listener and every connection; it tells you which ones have something to do. One thread, no switching, no mutexes.
+
+There's one catch. `poll()` says "fd 7 is readable," but it can be slightly wrong, or only 12 bytes might have arrived when I want 4096. In blocking mode, `read()` would then sleep waiting for the rest — and the whole event loop would sleep with it. So every fd has to be set non-blocking with `fcntl(fd, F_SETFL, O_NONBLOCK)`. After that, `read()` either returns whatever's available immediately, or returns -1 with `errno = EAGAIN` ("nothing right now, try again later"). The thread never sleeps inside a syscall. `poll()` and non-blocking I/O are complementary — `poll()` tells you which fds are worth touching, and non-blocking guarantees that touching them is safe.
+
+This forces the code to change shape. With blocking I/O, a connection lived inside one function call — you read, you process, you write, you return. With non-blocking I/O, that function might be entered four times before a single message has fully arrived. So a connection becomes a small state machine — `STATE_REQ` while it's reading, `STATE_RES` while it's writing, `STATE_END` when it's done — with its own read and write buffers that persist between calls. The main loop pokes each ready connection once per tick and lets it advance one step.
+
+A nice thing falls out for free. If three requests arrived in a single TCP packet, the read buffer now contains all three. After parsing the first, I `memmove` the leftover bytes to the front of the buffer and try again. The server pipelines without ever explicitly being told to.
+
+### [07_get_sel_del](./07_get_sel_del/) — teaching it what to do
+
+By now the server scales beautifully and does nothing of value. It echoes. To make it a key-value store I needed `GET key`, `SET key val`, `DEL key` — which means parsing structure out of the framed payload.
+
+The trick here is that protocols nest. Chapter 04's outer frame says "here are N bytes of payload." Those N bytes are now themselves a small protocol: a 4-byte count of how many strings, followed by each string as length + bytes. Effectively argv on the wire. `parse_req()` walks that buffer and produces a `vector<string>`; `do_request()` switches on `cmd[0]` (case-insensitive) and routes to one of three handlers. The response gets a similar structure: a result code (`RES_OK`, `RES_ERR`, `RES_NX`) followed by an optional value.
+
+The handlers themselves are deliberately boring. They poke a `std::map<string, string>`. A `std::map` is a red-black tree — every operation is O(log n), every node is its own heap allocation scattered across RAM, and the cache misses add up fast. It is, structurally, the opposite of what Redis is supposed to be.
+
+That was the point. The work in this chapter was getting the protocol-inside-a-protocol parsed correctly and the dispatch wired up cleanly. If I'd tried to do that *and* invent a hashtable simultaneously, I would have ended up debugging both at once and trusting neither. Get the layer above storage right, plug in a placeholder you trust, then earn the right to replace it.
+
+### [08_hashtables](./08_hashtables/) — earning the swap
+
+Now the placeholder gets replaced, and the design is shaped by two pressures. The obvious one: every operation should be fast, because every client request hits this code path. The less obvious one: the hashtable has to *grow* without ever blocking the event loop, because the entire single-threaded design from chapter 06 falls apart the moment one operation takes 50 milliseconds.
+
+Three ideas, each chosen against a specific cost.
+
+**Power-of-2 bucket counts.** Every operation has to map a hash to a bucket: `bucket = hash % n`. The `%` operator is integer division, which is one of the slower things a CPU can do on the hot path. But if `n` is a power of 2, `hash % n` equals `hash & (n - 1)` — bitwise AND, one cycle. Why? In binary, a power of 2 looks like `1` followed by zeros: `8 = 1000`. Subtract one and you get a clean run of low-order ones: `7 = 0111`. ANDing with that mask keeps the low bits and wipes the rest — which is exactly the remainder. So `h_init` asserts the bucket count is a power of 2 and precomputes `mask = n - 1`. The assertion isn't paranoia; it's the precondition that makes the bitwise trick correct everywhere downstream.
+
+**Intrusive nodes.** A normal hashtable holds pointers to values. Walking a hash chain means: load the node into cache, read the value pointer, then go fetch the value from RAM — and that fetch is roughly 100× slower than the cache access, because cache misses are how CPUs actually spend their time. The fix is to flip the relationship: instead of the node pointing at the value, embed the node *inside* the value's struct. Now the value comes along for free when the CPU pulls the node into cache. To recover the value pointer from a node pointer you use a small macro called `container_of` that subtracts the offset of the embedded field — which sounds like a dirty trick and is, but it's the dirty trick that makes the cache behaviour work out.
+
+**Progressive resizing.** This is the subtle one. When the table fills up (load factor 8 in this code), you have to grow it. The naive thing is to allocate a table twice the size and rehash every existing entry into it. For a table with a million entries that's tens of milliseconds — and for those tens of milliseconds, the event loop is frozen. Every connected client is waiting. The whole single-threaded design from chapter 06 was built to avoid exactly this kind of stall.
+
+So instead: allocate the new table, but don't rehash anything yet. Keep the old table alive. Every subsequent operation does a tiny amount of moving work — up to 128 nodes from the old table to the new one. Lookups check the new table first, then fall back to the old. Inserts always go to the new. Deletes try both. After a few thousand operations the old table is empty and gets freed. The user never sees a stall, because the cost of growth has been smeared invisibly across thousands of normal operations.
+
+That's the shape of the project so far: each chapter solves one problem that the previous chapter created, and the solution always involves understanding what the layer below actually guarantees — instead of what I'd assumed it guaranteed.
+
+(Numbering skips 05 because that chapter — non-blocking mode — got folded directly into 06.)
 
 ---
 
