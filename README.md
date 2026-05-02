@@ -14,7 +14,7 @@ I wanted to send a string from one program to another, so I learned the five-cal
 
 What I didn't see was that I'd asked for 6 bytes and happened to get them, and that this was luck. If the message had been longer, or the client farther away than localhost, the same `read()` would have returned partway through — `"he"`, maybe, or `"hell"` — and the rest would have shown up on the next call. My code had no idea that was even a possibility, because in my head a `read()` corresponded to a `write()`. One message in, one message out.
 
-The model that breaks it: TCP doesn't carry messages at all. It carries a stream of bytes. The sending kernel might split your `write("hello")` across packets, or batch it with the next one. The receiving kernel just dumps whatever arrives into a flat buffer, and `read()` scoops out whatever's there. If the sender wrote `"hello"` then `"world"`, the receiver's first `read()` might return `"hellow"`. There's no syscall anywhere that hands you exactly one message back — at this layer there is no such thing as a message.
+The model that breaks it: TCP doesn't carry messages at all. It carries a stream of bytes. The sending kernel might split your `write("hello")` across packets, or batch it with the next one. The receiving kernel just dumps whatever arrives into a [flat buffer](#kernel-send-and-receive-buffers), and `read()` scoops out whatever's there. If the sender wrote `"hello"` then `"world"`, the receiver's first `read()` might return `"hellow"`. There's no syscall anywhere that hands you exactly one message back — at this layer there is no such thing as a message.
 
 So my "working" code was a bug waiting to be tested by a longer string or a slower link. The fix couldn't come from a smarter `read()`; it had to come from a layer above the kernel. I had to invent the concept of a message myself.
 
@@ -299,6 +299,21 @@ Server:    read() → "hellow"   read() → "orld"
 ```
 
 There are *no walls* between writes. The "stream" isn't a consequence of physical wires — packets on the wire have boundaries. It's a deliberate design choice: TCP's job is reliable, ordered byte delivery, not message framing. UDP preserves boundaries (each `recv()` is one datagram); TCP doesn't. Framing is your application's job. That's the whole reason Chapter 04 exists.
+
+### Kernel send and receive buffers
+
+Every TCP socket has two buffers in kernel memory dedicated to it: a **send buffer** on the sender's side and a **receive buffer** on the receiver's side. Each is typically a few hundred KB. They're the actual machinery TCP runs on — every other behaviour in this section follows from how they work.
+
+When you call `write(fd, buf, n)`, the kernel **copies** your bytes into the send buffer and returns. It does *not* wait for those bytes to leave the machine. The kernel's TCP code then transmits whatever it can from the buffer whenever it can — based on the receiver's advertised window, the network's congestion state, MTU, timers — possibly splitting your one `write()` across many packets, or coalescing it with the next one. `write()` returning is decoupled from "the bytes being sent" entirely.
+
+When packets arrive on the receiving machine, the kernel reassembles them in order and dumps the payload bytes into the receive buffer. Each `read(fd, buf, n)` just pulls up to `n` bytes out of whatever's currently sitting there. There's no record of which bytes came from which `write()` — the buffer is a flat queue, message boundaries don't exist in it.
+
+Four behaviours fall out of this directly, and they explain almost everything about how the I/O code in this project is shaped:
+
+- **Partial reads.** `read()` returns whatever the receive buffer happens to hold *right now* — could be a fragment, could be multiple messages worth, could be nothing yet. This is the underlying reason the framing protocol from chapter 04 exists.
+- **Partial writes.** If the send buffer is nearly full, `write()` only copies as much as fits and returns the actual count. Hence `write_all()` looping until everything has been handed off.
+- **`EAGAIN` on a non-blocking `write()`.** Means the send buffer is full — there's literally no room to copy more. The kernel can't accept the bytes until its TCP code drains some of them onto the wire. Try again after `poll()` reports `POLLOUT`.
+- **Free pipelining.** Three small requests sent back-to-back can all sit in the receive buffer at once. A single `read()` pulls them all into the user-space `rbuf`, and `try_one_request()` parses them one at a time without going back to the kernel. The user-space `rbuf` and `wbuf` are essentially second-tier buffers mirroring the kernel ones — necessary because a single message can span multiple `read()` calls, so the application has to accumulate across them.
 
 ### Blocking vs non-blocking I/O
 
