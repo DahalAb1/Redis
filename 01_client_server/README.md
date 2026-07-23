@@ -1,4 +1,4 @@
-# 03 - Building a TCP Client & Server
+# 01 - Building a TCP Client & Server
 
 ## Motivation
 
@@ -181,7 +181,7 @@ Your code:   read() → whatever's available
 
 TCP *could* have preserved packet boundaries (UDP does — each `recv()` gives you exactly one datagram). TCP chose not to, because its job is **reliable, ordered byte delivery**, not message framing. It reorders out-of-order packets, retransmits lost ones, and merges everything into one flat buffer.
 
-Message framing is **your application's job** — which is why we need a protocol (covered in [04_protocol_client_server](../04_protocol_client_server/)).
+Message framing is **your application's job** — which is why we need a protocol (covered in [02_protocol_client_server](../02_protocol_client_server/)).
 
 ## Deep Dive: Byte Order (Endianness)
 
@@ -208,16 +208,16 @@ These are **smart** — on a big-endian machine they're no-ops, on little-endian
 
 ## Files
 
-- `03_server.cpp` — TCP server
-- `03_client.cpp` — TCP client
+- `01_server.cpp` — TCP server
+- `01_client.cpp` — TCP client
 - `Part 1.txt` — Raw learning notes
 
 ## Build & Run
 
 ```bash
 # Terminal 1
-g++ -o server.out 03_server.cpp && ./server.out
+g++ -o server.out 01_server.cpp && ./server.out
 
 # Terminal 2
-g++ -o client.out 03_client.cpp && ./client.out
+g++ -o client.out 01_client.cpp && ./client.out
 ```

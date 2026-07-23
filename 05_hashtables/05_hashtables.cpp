@@ -1,6 +1,6 @@
 #include <assert.h>
 #include <stdlib.h>
-#include "08_hashtable.h"
+#include "05_hashtable.h"
 
 // n must be a power of 2
 static void h_init(HTab *htab, size_t n) {

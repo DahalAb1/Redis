@@ -8,7 +8,7 @@ Each chapter introduces *one* problem and the smallest correct fix for it. Read 
 
 ## The journey
 
-### [03_client_server](./03_client_server/) — the call that lied
+### [01_client_server](./01_client_server/) — the call that lied
 
 I wanted to send a string from one program to another, so I learned the five-call ceremony — `socket`, `setsockopt`, `bind`, `listen`, `accept` — and wrote a server that did one thing: `read(connfd, rbuf, 6)`. The client wrote `"hello"`. The server printed `"hello"`. It looked finished.
 
@@ -18,22 +18,22 @@ The model that breaks it: TCP doesn't carry messages at all. It carries a stream
 
 So my "working" code was a bug waiting to be tested by a longer string or a slower link. The fix couldn't come from a smarter `read()`; it had to come from a layer above the kernel. I had to invent the concept of a message myself.
 
-### [04_protocol_client_server](./04_protocol_client_server/) — inventing messages
+### [02_protocol_client_server](./02_protocol_client_server/) — inventing messages
 
 If the kernel won't tell you where a message ends, the message has to tell you itself. The simplest thing that works: prefix every message with its length. Four bytes of `uint32_t`, then that many bytes of payload. The receiver reads exactly 4 bytes, decodes a number, then reads exactly that many more.
 
-That word *exactly* is doing a lot of work. A single `read()` might return fewer bytes than I asked for, for the same reason as in chapter 03. So I wrapped it in a loop:
+That word *exactly* is doing a lot of work. A single `read()` might return fewer bytes than I asked for, for the same reason as in chapter 01. So I wrapped it in a loop:
 
 ```cpp
 read_full(fd, buf, n);   // keep calling read() until n bytes have arrived
 write_all(fd, buf, n);   // same idea for write()
 ```
 
-This is the moment the mental model from chapter 03 actually finishes inverting. A "message" is not a thing TCP gives you. It's a contract you and the other side agree to honour, sitting one layer above the byte hose. You define the framing, you parse the framing, you enforce the framing. The transport doesn't care.
+This is the moment the mental model from chapter 01 actually finishes inverting. A "message" is not a thing TCP gives you. It's a contract you and the other side agree to honour, sitting one layer above the byte hose. You define the framing, you parse the framing, you enforce the framing. The transport doesn't care.
 
 With framing in place, the server could finally handle more than one request on a connection — `one_request()` in a loop until the client disconnected. But it still served one *client* at a time. As soon as the server entered `read_full()` waiting on client A, the kernel parked the entire thread on a wait queue. Client B could connect and sit there for hours; the server wouldn't even know it existed until A spoke. That isn't a bug in `read_full` — it's a property of the only tool I had. To serve many clients on one thread I'd need a fundamentally different way of asking the kernel "is anybody ready yet?"
 
-### [06_event_polling](./06_event_polling/) — many clients, one thread
+### [03_event_polling](./03_event_polling/) — many clients, one thread
 
 The obvious fix to "one client at a time" is a thread per client. It also doesn't work, and the reasons it doesn't work are worth understanding because they're the reason Redis is single-threaded in the first place.
 
@@ -49,25 +49,25 @@ This forces the code to change shape. With blocking I/O, a connection lived insi
 
 A nice thing falls out for free. If three requests arrived in a single TCP packet, the read buffer now contains all three. After parsing the first, I `memmove` the leftover bytes to the front of the buffer and try again. The server pipelines without ever explicitly being told to.
 
-### [07_get_sel_del](./07_get_sel_del/) — teaching it what to do
+### [04_get_set_del](./04_get_set_del/) — teaching it what to do
 
 By now the server scales beautifully and does nothing of value. It echoes. To make it a key-value store I needed `GET key`, `SET key val`, `DEL key` — which means parsing structure out of the framed payload.
 
-The trick is that protocols nest. Chapter 04's outer frame says "here are N bytes of payload." Those N bytes are now themselves a small protocol: a 4-byte count of how many strings, followed by each string as length + bytes. Effectively argv on the wire. The choice to length-prefix every string instead of delimiting them with a special byte (like CRLF) is deliberate — lengths are O(1) to validate against the remaining buffer, while delimiter scanning is O(n) and breaks the moment a value contains the delimiter byte. The framing layer never has to *look inside* the bytes; it just measures them.
+The trick is that protocols nest. Chapter 02's outer frame says "here are N bytes of payload." Those N bytes are now themselves a small protocol: a 4-byte count of how many strings, followed by each string as length + bytes. Effectively argv on the wire. The choice to length-prefix every string instead of delimiting them with a special byte (like CRLF) is deliberate — lengths are O(1) to validate against the remaining buffer, while delimiter scanning is O(n) and breaks the moment a value contains the delimiter byte. The framing layer never has to *look inside* the bytes; it just measures them.
 
 `parse_req()` walks the buffer and produces a `vector<string>`. `do_request()` switches on `cmd[0]` (case-insensitive via `strcasecmp` — small detail, but it's the difference between a usable interface and a fragile one) and routes to one of three handlers. The response has a mirror structure: a 4-byte result code (`RES_OK`, `RES_ERR`, `RES_NX`) followed by an optional value, all wrapped in the same outer length-prefix frame. The client does the same framing dance in reverse.
 
-The handlers themselves are deliberately boring — they poke a `std::map<string, string>`. A `std::map` is a red-black tree, which means every operation is O(log n) *and* every node is its own separate heap allocation, scattered across wherever the allocator happened to put it. Walking the tree means jumping around in memory, and every jump risks a **cache miss** — roughly a 100× slowdown when the CPU has to leave its on-chip cache and go fetch from RAM. This is the **data-locality** lens, and for a system whose hot path is "look up a small value by key, return it now," it's the lens that matters most: the algorithmic complexity is almost a sideshow next to the memory layout. `std::map` is structurally wrong on both counts. Chapter 08 picks up exactly this thread.
+The handlers themselves are deliberately boring — they poke a `std::map<string, string>`. A `std::map` is a red-black tree, which means every operation is O(log n) *and* every node is its own separate heap allocation, scattered across wherever the allocator happened to put it. Walking the tree means jumping around in memory, and every jump risks a **cache miss** — roughly a 100× slowdown when the CPU has to leave its on-chip cache and go fetch from RAM. This is the **data-locality** lens, and for a system whose hot path is "look up a small value by key, return it now," it's the lens that matters most: the algorithmic complexity is almost a sideshow next to the memory layout. `std::map` is structurally wrong on both counts. Chapter 05 picks up exactly this thread.
 
-### [08_hashtables](./08_hashtables/) — earning the swap
+### [05_hashtables](./05_hashtables/) — earning the swap
 
-Now the placeholder gets replaced, and the design is shaped by two pressures. The obvious one: every operation should be fast, because every client request hits this code path. The less obvious one: the hashtable has to *grow* without ever blocking the event loop, because the entire single-threaded design from chapter 06 falls apart the moment one operation takes 50 milliseconds.
+Now the placeholder gets replaced, and the design is shaped by two pressures. The obvious one: every operation should be fast, because every client request hits this code path. The less obvious one: the hashtable has to *grow* without ever blocking the event loop, because the entire single-threaded design from chapter 03 falls apart the moment one operation takes 50 milliseconds.
 
 Three ideas, each chosen against a specific cost.
 
 **Power-of-2 bucket counts.** Every operation has to map a hash to a bucket: `bucket = hash % n`. The `%` operator is integer division, which is one of the slower things a CPU can do on the hot path. But if `n` is a power of 2, `hash % n` equals `hash & (n - 1)` — bitwise AND, one cycle. Why? In binary, a power of 2 looks like `1` followed by zeros: `8 = 1000`. Subtract one and you get a clean run of low-order ones: `7 = 0111`. ANDing with that mask keeps the low bits and wipes the rest — which is exactly the remainder. So `h_init` asserts the bucket count is a power of 2 and precomputes `mask = n - 1`. The assertion isn't paranoia; it's the precondition that makes the bitwise trick correct everywhere downstream.
 
-**Intrusive nodes.** This is the most elegant of the three, and it's the natural extension of the data-locality lens from chapter 07. The conventional design has the data structure *own* its data: each hashtable node holds a pointer to a value that lives somewhere else in memory. Walking a chain means load the node, read the value pointer, then go fetch the value from RAM — and that last fetch is the same ~100× cache miss that made `std::map` so bad. You've changed the algorithm from O(log n) to O(1), but the actual bottleneck — chasing pointers across scattered allocations — is identical.
+**Intrusive nodes.** This is the most elegant of the three, and it's the natural extension of the data-locality lens from chapter 04. The conventional design has the data structure *own* its data: each hashtable node holds a pointer to a value that lives somewhere else in memory. Walking a chain means load the node, read the value pointer, then go fetch the value from RAM — and that last fetch is the same ~100× cache miss that made `std::map` so bad. You've changed the algorithm from O(log n) to O(1), but the actual bottleneck — chasing pointers across scattered allocations — is identical.
 
 The intrusive design inverts the ownership. The data structure doesn't hold the data; the data *hosts* the structure. The `HNode` is a field inside the `Entry` struct, sitting in the same allocation as the key and value:
 
@@ -83,17 +83,15 @@ When the CPU pulls the node into cache to compare hashes during a chain walk, th
 
 The trade-off is that you've lost the obvious way to get back from a node pointer to the entry that contains it — the `Entry*` is no longer stored anywhere, because the node *is* part of the entry. The fix is `container_of`: given a pointer to a struct field, subtract the field's offset within the struct to recover the pointer to the struct itself. It's the inverse of `offsetof`, and it sounds like a dirty pointer trick until you realize it's exactly the operation that makes the embedding coherent. The same pattern runs throughout the Linux kernel's intrusive linked lists; once you've seen it a few times it stops feeling like a trick and starts feeling like the obvious move whenever a data structure needs to know what contains it.
 
-**Progressive resizing.** This is the subtle one. When the table fills up (load factor 8 in this code), you have to grow it. The naive thing is to allocate a table twice the size and rehash every existing entry into it. For a table with a million entries that's tens of milliseconds — and for those tens of milliseconds, the event loop is frozen. Every connected client is waiting. The whole single-threaded design from chapter 06 was built to avoid exactly this kind of stall.
+**Progressive resizing.** This is the subtle one. When the table fills up (load factor 8 in this code), you have to grow it. The naive thing is to allocate a table twice the size and rehash every existing entry into it. For a table with a million entries that's tens of milliseconds — and for those tens of milliseconds, the event loop is frozen. Every connected client is waiting. The whole single-threaded design from chapter 03 was built to avoid exactly this kind of stall.
 
 So instead: allocate the new table, but don't rehash anything yet. Keep the old table alive. Every subsequent operation does a tiny amount of moving work — up to 128 nodes from the old table to the new one. Lookups check the new table first, then fall back to the old. Inserts always go to the new. Deletes try both. After a few thousand operations the old table is empty and gets freed. The user never sees a stall, because the cost of growth has been smeared invisibly across thousands of normal operations.
 
 That's the shape of the project so far: each chapter solves one problem that the previous chapter created, and the solution always involves understanding what the layer below actually guarantees — instead of what I'd assumed it guaranteed.
 
-(Numbering skips 05 because that chapter — non-blocking mode — got folded directly into 06.)
-
 ---
 
-## Final architecture (after chapter 08)
+## Final architecture (after chapter 05)
 
 ```
             ┌──────────────────────────────────────────────────┐
@@ -122,7 +120,23 @@ That's the shape of the project so far: each chapter solves one problem that the
 
 ---
 
-## Chapter 03 — Talking over TCP
+## Numbers
+
+Every design decision above is a claim, and claims are cheap. So I measured them.
+
+| | |
+|---|---|
+| **~1.04M GET ops/sec** | pipelined, single connection, single thread, loopback |
+| **p50 17µs** | request latency, no pipelining — a loopback round-trip |
+| **429µs worst insert @ 4M keys** | vs **241ms** for `std::unordered_map` — the progressive-resize claim, measured |
+
+That last row is the one I care about. "The user never sees a stall" was an assertion until there was a number next to it, and the honest version of that number is a *tail latency* result — not "faster than the standard library," which the benchmark does not show and does not claim.
+
+**[Full method, fairness caveats, and what these numbers don't prove → `bench/`](./bench/)**
+
+---
+
+## Chapter 01 — Talking over TCP
 
 **Problem.** Two programs need to exchange bytes over a network.
 
@@ -142,7 +156,7 @@ int connfd = accept(fd, ...);                         // blocks per client
 
 ---
 
-## Chapter 04 — Framing messages
+## Chapter 02 — Framing messages
 
 **Problem.** TCP doesn't preserve message boundaries. The receiver can't tell where one message ends and the next begins.
 
@@ -170,7 +184,7 @@ With framing in place, the server finally handles multiple requests on one conne
 
 ---
 
-## Chapter 06 — One thread, many clients
+## Chapter 03 — One thread, many clients
 
 **Problem.** A blocking server serves one client at a time. Threads/processes don't scale to thousands of mostly-idle connections.
 
@@ -200,7 +214,7 @@ The main loop, every tick:
 
 ---
 
-## Chapter 07 — GET, SET, DEL
+## Chapter 04 — GET, SET, DEL
 
 **Problem.** The server has plumbing but no semantics.
 
@@ -231,7 +245,7 @@ The client takes argv directly:
 
 ---
 
-## Chapter 08 — A real hashtable
+## Chapter 05 — A real hashtable
 
 **Problem.** Need O(1) average-case `get`/`set`/`del`, *and* a way to grow the table without ever blocking the event loop with a giant rehash.
 
@@ -262,14 +276,14 @@ Lookups check `ht1`, then `ht2`. Inserts go into `ht1`. Deletes try both. Hash f
 Each chapter is self-contained:
 
 ```bash
-# build server (chapter 08 has the multi-file case)
-cd 08_hashtables
-g++ -Wall -O2 -std=c++17 -o server.out 08_server.cpp 08_hashtables.cpp
+# build server (chapter 05 has the multi-file case)
+cd 05_hashtables
+g++ -Wall -O2 -std=c++17 -o server.out 05_server.cpp 05_hashtables.cpp
 ./server.out
 
-# in another terminal — chapter 07's client speaks the same protocol
-cd ../07_get_sel_del
-g++ -Wall -O2 -std=c++17 -o client.out 07_client.cpp
+# in another terminal — chapter 04's client speaks the same protocol
+cd ../04_get_set_del
+g++ -Wall -O2 -std=c++17 -o client.out 04_client.cpp
 ./client.out set foo bar
 ./client.out get foo
 ./client.out del foo
@@ -282,11 +296,12 @@ Earlier chapters build with a single `g++ -o out file.cpp`.
 ## Repo map
 
 ```
-03_client_server/             baseline TCP echo
-04_protocol_client_server/    + length-prefix framing
-06_event_polling/             + non-blocking + poll() event loop
-07_get_sel_del/               + GET/SET/DEL over std::map
-08_hashtables/                + custom intrusive hashtable
+01_client_server/             baseline TCP echo
+02_protocol_client_server/    + length-prefix framing
+03_event_polling/             + non-blocking + poll() event loop
+04_get_set_del/               + GET/SET/DEL over std::map
+05_hashtables/                + custom intrusive hashtable
+bench/                        throughput + resize-latency benchmarks
 self_test/                    scratchpad — gitignored
 ```
 
@@ -312,7 +327,7 @@ Recv buf:   [h][e][l][l][o][w][o][r][l][d]
 Server:    read() → "hellow"   read() → "orld"
 ```
 
-There are *no walls* between writes. The "stream" isn't a consequence of physical wires — packets on the wire have boundaries. It's a deliberate design choice: TCP's job is reliable, ordered byte delivery, not message framing. UDP preserves boundaries (each `recv()` is one datagram); TCP doesn't. Framing is your application's job. That's the whole reason Chapter 04 exists.
+There are *no walls* between writes. The "stream" isn't a consequence of physical wires — packets on the wire have boundaries. It's a deliberate design choice: TCP's job is reliable, ordered byte delivery, not message framing. UDP preserves boundaries (each `recv()` is one datagram); TCP doesn't. Framing is your application's job. That's the whole reason chapter 02 exists.
 
 ### Kernel send and receive buffers
 
@@ -324,7 +339,7 @@ When packets arrive on the receiving machine, the kernel reassembles them in ord
 
 Four behaviours fall out of this directly, and they explain almost everything about how the I/O code in this project is shaped:
 
-- **Partial reads.** `read()` returns whatever the receive buffer happens to hold *right now* — could be a fragment, could be multiple messages worth, could be nothing yet. This is the underlying reason the framing protocol from chapter 04 exists.
+- **Partial reads.** `read()` returns whatever the receive buffer happens to hold *right now* — could be a fragment, could be multiple messages worth, could be nothing yet. This is the underlying reason the framing protocol from chapter 02 exists.
 - **Partial writes.** If the send buffer is nearly full, `write()` only copies as much as fits and returns the actual count. Hence `write_all()` looping until everything has been handed off.
 - **`EAGAIN` on a non-blocking `write()`.** Means the send buffer is full — there's literally no room to copy more. The kernel can't accept the bytes until its TCP code drains some of them onto the wire. Try again after `poll()` reports `POLLOUT`.
 - **Free pipelining.** Three small requests sent back-to-back can all sit in the receive buffer at once. A single `read()` pulls them all into the user-space `rbuf`, and `try_one_request()` parses them one at a time without going back to the kernel. The user-space `rbuf` and `wbuf` are essentially second-tier buffers mirroring the kernel ones — necessary because a single message can span multiple `read()` calls, so the application has to accumulate across them.
@@ -474,7 +489,7 @@ I used to think classes existed to *hold* data. It's the other way around: data 
 
 ### Subtle bugs to watch for
 
-- `malloc()` doesn't run C++ constructors. Default member initializers like `int fd = -1` silently won't fire. Use `new` (or initialize every field explicitly after malloc — chapter 08's `accept_new_conn` does this).
+- `malloc()` doesn't run C++ constructors. Default member initializers like `int fd = -1` silently won't fire. Use `new` (or initialize every field explicitly after malloc — chapter 05's `accept_new_conn` does this).
 - `&data` vs `data` when `data` is already a pointer: `&data` is the address of the pointer itself, sitting on the stack. Compiles fine, crashes at runtime.
 
 ### C++ build pipeline (background)

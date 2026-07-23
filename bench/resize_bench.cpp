@@ -3,7 +3,7 @@
 // latency while the hashtable grows past its resize thresholds.
 //
 // Compares:
-//   custom   -- the server's HMap (08_hashtables.cpp): incremental resize,
+//   custom   -- the server's HMap (05_hashtables.cpp): incremental resize,
 //               migrates <=128 nodes per op, so no single op copies the table.
 //   std      -- std::unordered_map: rehashes ALL elements in one op when the
 //               load factor trips, so one insert stalls copying ~N nodes.
@@ -12,7 +12,7 @@
 // bucketed timeline so the spikes are visible. No network, no server: this
 // measures the data structure alone.
 //
-// Fairness notes (see notes.md):
+// Fairness notes (see bench/README.md):
 //  - custom Entry objects + their hashes are pre-built OUTSIDE the timed region,
 //    so the custom timing is pure insert+resize work, not malloc.
 //  - std::unordered_map is NOT reserve()'d, because a KV server cannot know the
@@ -31,7 +31,7 @@
 #include <unordered_map>
 #include <algorithm>
 
-#include "../08_hashtables/08_hashtable.h"
+#include "../05_hashtables/05_hashtable.h"
 
 // ---- glue copied from the server so we exercise the real HMap path ----
 #define container_of(ptr, type, member) ({                  \

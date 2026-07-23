@@ -1,8 +1,8 @@
-# 04 - Protocol: Client & Server
+# 02 - Protocol: Client & Server
 
 ## Motivation
 
-In [03_client_server](../03_client_server/), we built a basic TCP client and server. But that code was **technically broken** — it assumed `read()` would return the entire message in one call.
+In [01_client_server](../01_client_server/), we built a basic TCP client and server. But that code was **technically broken** — it assumed `read()` would return the entire message in one call.
 
 TCP is a **byte stream**, not a message stream. The kernel buffers incoming data and `read()` returns however many bytes are available — could be partial, could be multiple messages merged together. There are no message boundaries.
 
@@ -61,15 +61,15 @@ The code uses `memcpy(&len, rbuf, 4)` and assumes little-endian for the protocol
 
 ## Files
 
-- `04_server.cpp` — Server that reads length-prefixed messages and replies
-- `04_client.cpp` — Client that sends length-prefixed messages
+- `02_server.cpp` — Server that reads length-prefixed messages and replies
+- `02_client.cpp` — Client that sends length-prefixed messages
 
 ## Build & Run
 
 ```bash
 # Terminal 1: Start server
-g++ -o server.out 04_server.cpp && ./server.out
+g++ -o server.out 02_server.cpp && ./server.out
 
 # Terminal 2: Run client
-g++ -o client.out 04_client.cpp && ./client.out
+g++ -o client.out 02_client.cpp && ./client.out
 ```
