@@ -1,6 +1,6 @@
 # Building Redis From Scratch
 
-This is a ground-up implementation of a Redis-style key-value server in C++ — built without frameworks or abstractions in the way, working directly with sockets, the kernel, and bytes on the wire.
+A Redis-style key-value server in C++ — no frameworks, no abstractions in the way; raw sockets, the kernel, and bytes on the wire. Built by working through James Smith's [*Build Your Own Redis*](https://build-your-own.org/redis/), every line typed and understood by hand, then extended with my own benchmarking and analysis (see [Provenance](#provenance) for exactly what's the book's and what's mine).
 
 Each chapter introduces *one* problem and the smallest correct fix for it. Read in order, the working server emerges from `socket(2)` in five steps.
 
@@ -304,6 +304,22 @@ Earlier chapters build with a single `g++ -o out file.cpp`.
 bench/                        throughput + resize-latency benchmarks
 self_test/                    scratchpad — gitignored
 ```
+
+---
+
+## Provenance
+
+This project follows [*Build Your Own Redis with C/C++*](https://build-your-own.org/redis/) by James Smith. Being precise about what that means:
+
+**From the book:**
+- The overall architecture and chapter progression — TCP basics → length-prefix framing → `poll()` event loop → GET/SET/DEL → intrusive hashtable.
+- The protocol design (outer length-prefix frame, inner argv-style string list) and the core data-structure design (intrusive `HNode`, two-table progressive resize, power-of-2 masking).
+- Identifier names (`k_max_msg`, `try_one_request`, `HMap`, `hm_help_resizing`, …). Kept deliberately, so the code can be read side-by-side with the book. Renaming them would only obscure where the design came from.
+
+**Written independently:**
+- All code was typed by hand, chapter by chapter — no copy-paste — which is where the debugging (and the learning) happened.
+- Everything in this README and the [Notes from the trenches](#notes-from-the-trenches): the mental models here are my own reconstruction of *why* the code is shaped the way it is, not the book's text.
+- Everything in [`bench/`](./bench/): both benchmarks, the methodology, the fairness analysis, and the measured claims. The book asserts the design is fast; the numbers here are mine.
 
 ---
 
