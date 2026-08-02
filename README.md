@@ -41,7 +41,7 @@ Each thread reserves a stack — 8 MB by default on Linux. Ten thousand connecte
 
 Then I noticed the thing that makes this whole approach unnecessary: of those ten thousand connected clients, at any given instant maybe fifty actually have data ready to be read. The other 9,950 are idle, waiting on the user, the network, whatever. Dedicating a thread to each of them is paying the cost of switching between 10,000 things to do work for only 50.
 
-The alternative: ask the kernel directly. `poll()` takes an array of file descriptors and returns the ones that are actually ready. Hand it the listener and every connection; it tells you which ones have something to do. One thread, no switching, no mutexes.
+The alternative: ask the kernel directly. `poll()` takes an array of file descriptors and returns the ones that are actually ready. Hand it the listener and every connection; it tells you which ones have something to do. One thread, no switching, no mutexes — though `poll()` still scans every connection each tick to find out which ones qualify, so idle connections aren't free, just far cheaper than a thread each. [Measured →](./bench/#concurrency-one-thread-many-connections)
 
 There's one catch. `poll()` says "fd 7 is readable," but it can be slightly wrong, or only 12 bytes might have arrived when I want 4096. In blocking mode, `read()` would then sleep waiting for the rest — and the whole event loop would sleep with it. So every fd has to be set non-blocking with `fcntl(fd, F_SETFL, O_NONBLOCK)`. After that, `read()` either returns whatever's available immediately, or returns -1 with `errno = EAGAIN` ("nothing right now, try again later"). The thread never sleeps inside a syscall. `poll()` and non-blocking I/O are complementary — `poll()` tells you which fds are worth touching, and non-blocking guarantees that touching them is safe.
 
@@ -129,6 +129,7 @@ Every design decision above is a claim, and claims are cheap. So I measured them
 | **~1.04M GET ops/sec** | pipelined, single connection, single thread, loopback |
 | **p50 17µs** | request latency, no pipelining — a loopback round-trip |
 | **429µs worst insert @ 4M keys** | vs **241ms** for `std::unordered_map` — the progressive-resize claim, measured |
+| **~10KB RSS per idle connection, 5,000 held on one thread** | vs a 512KB stack per thread — but `poll()` adds ~0.3µs per idle connection to every request; not free, just far cheaper |
 
 That last row is the one I care about. "The user never sees a stall" was an assertion until there was a number next to it, and the honest version of that number is a *tail latency* result — not "faster than the standard library," which the benchmark does not show and does not claim.
 
@@ -386,7 +387,7 @@ Redis uses a single thread. With 10,000 clients, how does that thread know which
 
 **Approach 2 — thread per connection.** No TLB flush, but each thread needs an 8 MB stack. 10,000 threads = 80 GB of reserved stack. Switches still cost ~1-5 μs. And all threads share the hashtable, so you need mutexes — contention becomes the bottleneck.
 
-**Approach 3 — event loop.** One thread, one stack, zero context switches. `poll()` says "fds 5, 9, 23 have data." Serve those three (~3 μs total), park back in `poll()`. The key insight: at any instant, of 10,000 clients, maybe 50 have data ready. The other 9,950 are idle. Threads waste time switching between threads with nothing to do; the event loop skips them entirely.
+**Approach 3 — event loop.** One thread, one stack, zero context switches. `poll()` says "fds 5, 9, 23 have data." Serve those three (~3 μs total), park back in `poll()`. The key insight: at any instant, of 10,000 clients, maybe 50 have data ready. The other 9,950 are idle. Threads waste time switching between threads with nothing to do; the event loop only *touches* the ones with data — but "skips them entirely" undersells what `poll()` actually does. It still walks the full fd array every call to find out which 50 qualify, so the other 9,950 aren't skipped so much as scanned and discarded. Idle connections cost far less than idle threads, but they don't cost zero — [measured at ~0.3μs per idle connection per request](./bench/#concurrency-one-thread-many-connections).
 
 ### `pollfd`
 
